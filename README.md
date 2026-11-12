@@ -15,8 +15,8 @@ finds the same relations as las.
 
 ## Requirements
 
-- An NVIDIA GPU of compute capability 7.0 or later, with enough memory for the chosen sieve region (see
-  [GPU memory](#gpu-memory)).
+- An NVIDIA GPU of compute capability 7.0 or later. GPUs with less memory sieve each special-q in more
+  passes (see [GPU memory](#gpu-memory)).
 - Linux, the CUDA Toolkit, GCC with OpenMP, and make.
 - NFS_factory from the fork linked above, which has `format: keys` and reads `.ab` files from standard input.
 
@@ -147,8 +147,10 @@ slack between the two keeps almost only smooth pairs: 60-95 % of the survivors p
 allows. The classic
 mode, with `-lim` below `2^lpb` and `-mfb 2*lpb`, writes 15-20 times as many survivors, most of them not smooth.
 
-**Sieve region.** `-I 17` gives the most relations per special-q, but needs a GPU with 32 GB at lim `2^28` and above.
-`-I 16` needs about a third of that memory and `-I 15` about a tenth.
+**Sieve region.** Each step up in `-I` takes about 4 times as long per special-q and gives 1.8 (degree 7) to 3.6
+(rational side) times as many relations, so the relations per GPU hour drop with it, the more so for high degrees.
+`-I 16` and `-I 17` are the usual choices; up to `-I 19` works. A larger `-I` needs no larger GPU: gpusieve sieves a
+special-q in as many passes as needed (see [GPU memory](#gpu-memory)).
 
 **Special-q range.** Small special-q give the smallest pairs, which are the most useful ones, but more duplicates and
 many survivors per special-q (raise `-maxout` if the run reports dropped survivors). `-random N` sieves N random
@@ -163,7 +165,8 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 |---|---|---|
 | `-poly FILE` | CADO-NFS poly file | |
 | `-side 0\|1` | side to sieve | algebraic if its degree is 2 or more, else rational |
-| `-I N` | sieve region of `2^N` by up to `2^(N-1)`, N from 10 to 17 | 15 |
+| `-I N` | sieve region of `2^N` by up to `2^(N-1)`, N from 10 to 19 | 15 |
+| `-parts N` | sieve each special-q in N passes over its rows, N a power of 2 | as few as fit into the GPU's memory and L2 cache |
 | `-lim L` | factor base bound (below `2^32`) | 25000000 |
 | `-mfb B` | bits of the value allowed beyond the factor base | 56 |
 | `-slack S` | extra bits for prime powers and rounding | 12 |
@@ -177,23 +180,34 @@ counts as a large prime there. Then use a lim of at least the largest special-q 
 | `-progress S` | a progress line every S seconds, 0 for none | 60 |
 | `-v` | timings of each special-q | |
 
-Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a row, default 1024),
+Tuning options, rarely needed: `-tiny P` (primes below P are sieved by all threads of a region, default 64),
 `-lanes 2` (fill the buckets of the next special-q while the rows of this one are sieved), `-bblocks N` and
 `-rblocks N` (persistent grids for the two kernels), `-twopass` (another bucket kernel), and `-dumpfb FILE` (write the
 factor base and stop).
 
 ## GPU memory
 
-At startup gpusieve prints the memory it needs and stops if the GPU does not have it. Most of it is bucket memory, which
-grows with the sieve region and the factor base bound:
+The buckets hold the hits of the large primes. For a whole special-q they grow with the sieve region and the factor
+base bound:
 
-| `-I` | `-lim` | GPU memory |
+| `-I` | `-lim` | buckets of a whole special-q |
 |---|---|---|
 | 15 | 25000000 | 1.6 GB |
 | 16 | 25000000 | 5.3 GB |
 | 15 | `2^29` | 2.3 GB |
 | 17 | `2^28` | 24.3 GB |
 | 17 | `2^29` | 25.5 GB |
+| 18 | `2^28` | 85 GB |
+| 19 | `2^28` | 296 GB |
+
+gpusieve sieves each special-q in N passes over its rows (N a power of 2) and holds the buckets of one pass at a time,
+1/N of the value above. It chooses N so that they fit into the free GPU memory, and so that a pass has at most about
+L2/256 bucket regions: the ends of the buckets being filled then stay in the GPU's L2 cache, which makes the bucket
+fill faster (with a 4.5 MB L2, 16 passes at `-I 17` were 1.9 times as fast as 2). `-parts N` sets N.
+
+Besides one pass' buckets, the GPU holds the factor base (about 30 bytes per entry, 0.4 GB at lim `2^28` on a rational
+side, 0.8 GB at lim `2^29` on a side of degree 7) and two output buffers (32 MB per `-maxout` unit, 512 MB by default).
+At startup gpusieve prints the number of passes and the memory it needs, and stops if the GPU does not have it.
 
 ## Output format (.ab)
 
@@ -223,7 +237,9 @@ The lattice bases and J are the same as las'. `test/` holds poly files and las o
 
 - The poly file's other side, which gpusieve does not sieve, must be linear: a dummy such as `2x - 1` (see
   [Poly files](#1-poly-files)). A polynomial of degree 2 or more there is refused.
-- Degree up to 8, `-I` up to 17, `-lim` below `2^32`.
+- Degree up to 8, `-I` up to 19, `-lim` below `2^32`.
+- `b` must stay below `2^32` (it has 32 bits in `.ab` files, NFS_factory and msieve). Larger `b` occur at large `-I`
+  with large special-q (`-I 19`: above about `10^8`); such survivors are left out and counted at the end of the run.
 - Prime powers above `2^I` are not sieved; the slack covers most of them.
 - Tested on Linux only (absort maps its inputs into memory).
 

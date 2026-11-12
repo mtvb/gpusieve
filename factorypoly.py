@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """GNFS polynomials for a number N with a FIXED rational side x - m (the shared side of a factorization factory).
 
-    factorypoly.py N m [-d 5] [-K 4] [-H 1] [-Bf 1.4e7] [-Bg 1.1e7] [-area 1e16] [-keep 3] [-j 16] [-cado DIR] [-out f.poly]
+    factorypoly.py N m -cado DIR [-d 5] [-K 4] [-H 1] [-Bf 1.4e7] [-Bg 1.1e7] [-area 1e16] [-keep 3] [-j 16] [-out f.poly]
+
+-cado DIR: the polyselect folder of a CADO-NFS build (with its programs skewness and score), e.g. build/<host>/polyselect.
 
 Every polynomial f of degree d with f(m) = k*N has the root m modulo N, so (f, x - m) is a GNFS pair for N. Candidates:
   - multipliers k = 1..K (f(m) = k*N), each written in base m with digits in (-m/2, m/2] (the leading digit must stay
@@ -20,13 +22,15 @@ def main():
         sys.exit(__doc__)
     N, m = int(a[0]), int(float(a[1])) if 'e' in a[1].lower() else int(a[1])
     opt = {'-d': '5', '-K': '4', '-H': '1', '-Bf': '1.4e7', '-Bg': '1.1e7', '-area': '1e16', '-keep': '3', '-j': '16',
-           '-cado': '/root/cado-nfs/build/s140/polyselect', '-out': ''}
+           '-cado': '', '-out': ''}
     for i in range(2, len(a), 2):
         if a[i] not in opt:
             sys.exit(f'unknown option {a[i]}')
         opt[a[i]] = a[i + 1]
     d, K, H, keep, j = int(opt['-d']), int(opt['-K']), int(opt['-H']), int(opt['-keep']), int(opt['-j'])
     cado = opt['-cado']
+    if not (os.access(os.path.join(cado, 'skewness'), os.X_OK) and os.access(os.path.join(cado, 'score'), os.X_OK)):
+        sys.exit('-cado DIR must name the polyselect folder of a CADO-NFS build (with skewness and score)')
     sc = ['-Bf', opt['-Bf'], '-Bg', opt['-Bg'], '-area', opt['-area']]
 
     def basem(x):
