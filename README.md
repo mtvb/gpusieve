@@ -201,9 +201,11 @@ base bound:
 | 19 | `2^28` | 296 GB |
 
 gpusieve sieves each special-q in N passes over its rows (N a power of 2) and holds the buckets of one pass at a time,
-1/N of the value above. It chooses N so that they fit into the free GPU memory, and so that a pass has at most about
-L2/256 bucket regions: the ends of the buckets being filled then stay in the GPU's L2 cache, which makes the bucket
-fill faster (with a 4.5 MB L2, 16 passes at `-I 17` were 1.9 times as fast as 2). `-parts N` sets N.
+1/N of the value above. It chooses N so that they fit into the free GPU memory, and so that a pass has at most L2/256
+and at most 65536 bucket regions (a region is 32768 columns of one row): the ends of the buckets being filled then stay
+in the GPU's L2 cache, which makes the bucket fill faster. With a 4.5 MB L2, 16 passes at `-I 17` were 1.9 times as fast
+as 2; with a 96 MB L2, 4 passes at `-I 17` were 1.25 times as fast as 1. Each further pass costs about 1 ms per
+special-q. `-parts N` sets N.
 
 Besides one pass' buckets, the GPU holds the factor base (about 30 bytes per entry, 0.4 GB at lim `2^28` on a rational
 side, 0.8 GB at lim `2^29` on a side of degree 7) and two output buffers (32 MB per `-maxout` unit, 512 MB by default).

@@ -971,11 +971,13 @@ int main(int argc, char** argv)
 			}
 			nparts = (uint32_t)nparts_opt;
 		} else {
-			// as few passes as fit into the memory, and with at most about L2/256 bucket regions per pass, so that the ends of
-			// the buckets being filled stay in the L2 cache (with a 4.5 MB L2: fastest with 16384 regions per pass at I = 16
-			// and 17, 1.5 times faster than one pass)
+			// as few passes as fit into the memory, and with at most L2/256 and at most 65536 bucket regions per pass, so that
+			// the ends of the buckets being filled stay in the L2 cache. In tests, a 4.5 MB L2 was fastest with 16384 regions
+			// per pass at I = 16 and 17 (1.5 times faster than one pass), a 96 MB L2 with 65536 at I = 16 to 19 (1.25 times
+			// faster than 262144); more passes cost about 1 ms each.
 			int l2 = 0; CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0));
-			while (nparts < Jmax && (need_for(nparts) > freeb * 0.95 || (size_t)(Jmax / nparts) * rpr * 256 > (size_t)l2)) nparts *= 2;
+			const size_t maxreg = std::min<size_t>((size_t)l2 / 256, 65536);
+			while (nparts < Jmax && (need_for(nparts) > freeb * 0.95 || (size_t)(Jmax / nparts) * rpr > maxreg)) nparts *= 2;
 		}
 		const size_t need = need_for(nparts);
 		fprintf(stderr, "buckets: %zu regions of %u columns (%u per row), %u entries each (expected %.0f), in %u pass%s of %u rows: "
