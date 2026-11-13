@@ -96,7 +96,10 @@ absort -side 0 -o store.ab part1.txt part2.txt ...
 ```
 
 absort sorts all pairs, removes duplicates (a pair is found by every special-q that divides its value), and writes one
-`.ab` file. `-side 0` marks the store as smooth on side 0.
+`.ab` file. `-side 0` marks the store as smooth on side 0. It needs 16 bytes of memory per pair. When the pairs need more
+than 90% of the available memory, absort sorts them in batches, writes each batch to a temporary file (8 bytes per pair,
+in the output's folder or `-tmp DIR`), and merges these into the output. The temporary files need up to 8 bytes per pair
+of disk space, which the merge gives back as it goes.
 
 ### 5. Use the store for a number
 
@@ -221,7 +224,7 @@ of each special-q before the next, in ascending order of special-q, and does not
 
 | Tool | Purpose |
 |---|---|
-| `absort [-side S] [-threads N] -o out.ab in ...` | Sorts `.ab` files and text files of `a,b` lines by (a, b), removes duplicates, and writes one `.ab` file (`-o -` for standard output). Needs 16 bytes of memory per pair. |
+| `absort [-side S] [-threads N] [-mem GB] [-tmp DIR] -o out.ab in ...` | Sorts `.ab` files and text files of `a,b` lines by (a, b), removes duplicates, and writes one `.ab` file (`-o -` for standard output). Needs 16 bytes of memory per pair, and uses at most 90% of the available memory (or `-mem GB`). If it needs more, it sorts in batches and merges them through temporary files of 8 bytes per pair in `-tmp DIR` (default: the output's folder). |
 | `ab2keys file.ab ...` | Writes the pairs of `.ab` files as `a,b` lines. |
 | `lastq.py poly file.ab Q0 Q1 [-side S]` | The special-q of the last pair of an interrupted run, to continue with `-q0`. |
 | `lasnorm.pl` | Rewrites CADO-format relations as las prints them, so that `sort -u` removes relations found by both. |
@@ -232,8 +235,7 @@ of each special-q before the next, in ascending order of special-q, and does not
 On the same special-q as CADO-NFS las, gpusieve with the NFS_factory check finds las' relations (rational sides at
 I = 15 and 16, algebraic sides of degree 6 and 7 at I = 15), except a few in 100,000. Those contain a prime power
 that the sieve counts only once, and a larger slack keeps most of them. It also finds a few relations that las misses.
-The lattice bases and J are the same as las'. `test/` holds poly files and las outputs of these comparisons, and
-`compare.py`, which compares two relation sets per special-q.
+The lattice bases and J are the same as las'.
 
 ## Limitations
 
