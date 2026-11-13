@@ -7,6 +7,7 @@
 // (xz -d or pixz -d return the .ab unchanged.)
 //
 //     absort [-side 0|1] [-threads N] [-mem GB] [-tmp DIR] -o out.ab in1 [in2 ...]
+//     absort -merge [-side 0|1] -o out.ab sorted1.ab [sorted2.ab ...]
 //
 // Inputs: .ab files (recognized by their header) and text files whose lines start with "a,b": NFS_factory's
 // "format: keys", ab2keys output, or relations "a,b:..." (the rest of a line after b is ignored). Lines that do not start
@@ -20,6 +21,10 @@
 // -tmp DIR (default: the folder of the output file, or the current folder for -o -), and then merges these files into
 // the output in pieces of key ranges that fit. The temporary files are deleted as soon as they are created (absort
 // keeps them open), so nothing is left behind if it stops, and the merge gives their space back as it goes.
+// -merge: the inputs are .ab files that are already sorted, as absort writes them (- reads one of them from standard
+// input). They are merged in one pass with a buffer of 3 MB each, duplicates removed, for example to add a newly sorted
+// batch of pairs to an existing store without sorting the store again. An input that is not sorted stops the merge with
+// an error. The output must not be one of the inputs.
 //
 // Build: g++ -O3 -fopenmp -o absort absort.cpp
 #include <cstdio>
@@ -419,11 +424,246 @@ std::string folder_of(const std::string& path)
 	return s == 0 ? "/" : path.substr(0, s);
 }
 
+// -merge: an input .ab file already sorted by (a, b), read through a buffer of its own.
+struct MergeInput
+{
+	std::string name;
+	FILE* f = nullptr;
+	std::vector<char> buf;
+	size_t pos = 0, len = 0, tail = 0;   // tail: bytes of an incomplete pair at its end
+	int64_t a = 0;
+	uint32_t b = 0;
+	unsigned long long pairs = 0;
+};
+
+// The next pair of the input into (a, b); false at its end.
+bool merge_read(MergeInput& m)
+{
+	if (m.len - m.pos < AB_RECORD)
+	{
+		const size_t rest = m.len - m.pos;
+		memmove(m.buf.data(), m.buf.data() + m.pos, rest);
+		m.len = rest + fread(m.buf.data() + rest, 1, m.buf.size() - rest, m.f);
+		m.pos = 0;
+		if (m.len < AB_RECORD)
+		{
+			m.tail = m.len;
+			return false;
+		}
+	}
+	memcpy(&m.a, m.buf.data() + m.pos, 8);
+	memcpy(&m.b, m.buf.data() + m.pos + 8, 4);
+	m.pos += AB_RECORD;
+	m.pairs++;
+	return true;
+}
+
+bool same_file(const std::string& x, const std::string& y)
+{
+	struct stat s, t;
+	return x != "-" && y != "-" && stat(x.c_str(), &s) == 0 && stat(y.c_str(), &t) == 0 && s.st_dev == t.st_dev && s.st_ino == t.st_ino;
+}
+
+// Merges .ab files that are each sorted by (a, b), as absort writes them, into one, in one pass and with a buffer of 3 MB
+// per input, and removes the duplicates. An input that is not sorted stops the merge with an error.
+int merge_sorted(const std::vector<Input>& inputs, int side, const std::string& outname)
+{
+	const double t0 = now();
+	std::vector<MergeInput> in(inputs.size());
+	int in_side = -1;
+	for (size_t k = 0; k < inputs.size(); k++)
+	{
+		MergeInput& m = in[k];
+		m.name = inputs[k].name;
+		if (same_file(m.name, outname))
+		{
+			fprintf(stderr, "absort: %s is an input and the output (with -merge, write to another file)\n", m.name.c_str());
+			return 1;
+		}
+		m.f = m.name == "-" ? stdin : fopen(m.name.c_str(), "rb");
+		unsigned char h[AB_HEADER];
+		uint32_t version = 0, s = 0;
+		if (!m.f || fread(h, 1, AB_HEADER, m.f) != AB_HEADER || memcmp(h, "NFAB", 4) != 0)
+		{
+			fprintf(stderr, "absort: %s is not an .ab file (-merge reads only .ab files)\n", m.name.c_str());
+			return 1;
+		}
+		memcpy(&version, h + 4, 4);
+		memcpy(&s, h + 8, 4);
+		if (version != 1)
+		{
+			fprintf(stderr, "absort: %s is an .ab file of version %u, not 1\n", m.name.c_str(), version);
+			return 1;
+		}
+		if (in_side < 0)
+		{
+			in_side = (int)s;
+		}
+		else if (in_side != (int)s && side < 0)
+		{
+			fprintf(stderr, "absort: the .ab inputs are of different sides (%s: %u); choose one with -side\n", m.name.c_str(), s);
+			return 1;
+		}
+		m.buf.resize(AB_RECORD << 18);
+	}
+	if (side < 0)
+	{
+		side = in_side;
+	}
+	FILE* out = outname == "-" ? stdout : fopen(outname.c_str(), "wb");
+	if (!out)
+	{
+		fprintf(stderr, "absort: cannot create %s\n", outname.c_str());
+		return 1;
+	}
+	char header[AB_HEADER];
+	const uint32_t hv[3] = { 1, (uint32_t)side, 0 };
+	memcpy(header, "NFAB", 4);
+	memcpy(header + 4, hv, 12);
+	bool ok = fwrite(header, 1, AB_HEADER, out) == AB_HEADER;
+
+	// A binary heap of the inputs by their current pair, kept in the heap as (a with its sign bit flipped, b), whose unsigned
+	// order is the order of (a, b). The smallest is written (unless it equals the pair written last), replaced by the next
+	// pair of its input, and sifted down.
+	struct Node
+	{
+		uint64_t hi;
+		uint32_t lo, input;
+		bool operator<(const Node& o) const { return hi != o.hi ? hi < o.hi : lo < o.lo; }
+	};
+	auto node = [&](uint32_t k) { return Node{ (uint64_t)in[k].a ^ (1ull << 63), in[k].b, k }; };
+	std::vector<Node> heap;
+	for (uint32_t k = 0; k < (uint32_t)in.size(); k++)
+	{
+		if (merge_read(in[k]))
+		{
+			heap.push_back(node(k));
+		}
+	}
+	auto sift_down = [&](size_t i)
+	{
+		const size_t n = heap.size();
+		const Node x = heap[i];
+		for (;;)
+		{
+			size_t c = 2 * i + 1;
+			if (c >= n)
+			{
+				break;
+			}
+			if (c + 1 < n && heap[c + 1] < heap[c])
+			{
+				c++;
+			}
+			if (!(heap[c] < x))
+			{
+				break;
+			}
+			heap[i] = heap[c];
+			i = c;
+		}
+		heap[i] = x;
+	};
+	for (size_t i = heap.size() / 2; i-- > 0;)
+	{
+		sift_down(i);
+	}
+	std::vector<char> obuf(AB_RECORD << 20);
+	size_t used = 0;
+	unsigned long long written = 0;
+	bool have_last = false;
+	Node last{ 0, 0, 0 };
+	auto fail = [&](void)
+	{
+		if (out != stdout)
+		{
+			fclose(out);
+			unlink(outname.c_str());
+		}
+		return 1;
+	};
+	while (!heap.empty() && ok)
+	{
+		const Node top = heap[0];
+		if (!have_last || top.hi != last.hi || top.lo != last.lo)
+		{
+			if (used == obuf.size())
+			{
+				ok = fwrite(obuf.data(), 1, used, out) == used;
+				used = 0;
+			}
+			put_record(&obuf[used], (int64_t)(top.hi ^ (1ull << 63)), top.lo);
+			used += AB_RECORD;
+			written++;
+			last = top;
+			have_last = true;
+		}
+		MergeInput& m = in[top.input];
+		if (merge_read(m))
+		{
+			heap[0] = node(top.input);
+			if (heap[0] < top)
+			{
+				fprintf(stderr, "absort: %s is not sorted by (a, b) (pair %llu: %lld,%u after %lld,%u); sort it with absort first\n",
+					m.name.c_str(), m.pairs, (long long)m.a, m.b, (long long)(top.hi ^ (1ull << 63)), top.lo);
+				return fail();
+			}
+		}
+		else
+		{
+			heap[0] = heap.back();
+			heap.pop_back();
+		}
+		if (!heap.empty())
+		{
+			sift_down(0);
+		}
+	}
+	ok = ok && fwrite(obuf.data(), 1, used, out) == used;
+	if (out != stdout)
+	{
+		ok = fclose(out) == 0 && ok;
+	}
+	else
+	{
+		ok = fflush(out) == 0 && ok;
+	}
+	if (!ok)
+	{
+		fprintf(stderr, "absort: writing %s failed\n", outname.c_str());
+		return 1;
+	}
+	unsigned long long total = 0;
+	for (MergeInput& m : in)
+	{
+		if (m.tail)
+		{
+			fprintf(stderr, "absort: warning: %s ends with %zu bytes of an incomplete pair (ignored)\n", m.name.c_str(), m.tail);
+		}
+		if (ferror(m.f))
+		{
+			fprintf(stderr, "absort: reading %s failed\n", m.name.c_str());
+			return 1;
+		}
+		fprintf(stderr, "absort: %s: %llu pairs\n", m.name.c_str(), m.pairs);
+		total += m.pairs;
+		if (m.f != stdin)
+		{
+			fclose(m.f);
+		}
+	}
+	fprintf(stderr, "absort: merged %llu pairs of %zu files; %llu duplicates removed, wrote %llu pairs (side %d) to %s in %.1f s\n",
+		total, in.size(), total - written, written, side, outname.c_str(), now() - t0);
+	return 0;
+}
+
 int usage()
 {
 	fprintf(stderr, "usage: absort [-side 0|1] [-threads N] [-mem GB] [-tmp DIR] -o out.ab in1 [in2 ...]\n"
+		"       absort -merge [-side 0|1] -o out.ab sorted1.ab [sorted2.ab ...]\n"
 		"  sorts the pairs of .ab and text (\"a,b\" lines) files by (a, b), removes duplicates, writes one .ab file;\n"
-		"  uses at most 90%% of the available memory (or -mem GB), and temporary files in DIR if it needs more\n");
+		"  uses at most 90%% of the available memory (or -mem GB), and temporary files in DIR if it needs more.\n"
+		"  -merge: merges .ab files that are already sorted (absort output) in one pass, with little memory\n");
 	return 1;
 }
 
@@ -433,12 +673,17 @@ int main(int argc, char** argv)
 {
 	int side = -1, threads = omp_get_max_threads();
 	double mem_gb = 0;
+	bool merge = false;
 	std::string outname, tmpdir;
 	std::vector<Input> inputs;
 	for (int i = 1; i < argc; i++)
 	{
 		std::string s = argv[i];
-		if (s == "-side" && i + 1 < argc)
+		if (s == "-merge")
+		{
+			merge = true;
+		}
+		else if (s == "-side" && i + 1 < argc)
 		{
 			side = atoi(argv[++i]);
 			if (side != 0 && side != 1)
@@ -480,6 +725,10 @@ int main(int argc, char** argv)
 	if (outname.empty() || inputs.empty() || threads < 1)
 	{
 		return usage();
+	}
+	if (merge)
+	{
+		return merge_sorted(inputs, side, outname);
 	}
 	omp_set_num_threads(threads);
 	const bool to_stdout = outname == "-";

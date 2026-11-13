@@ -451,7 +451,9 @@ __device__ uint32_t d_invmod(uint32_t a, uint32_t m)
 // rational side (y1, y0) = (Y1, Y0) mod p, needing no root (so primes dividing Y1 are handled too); on a side of degree >= 2
 // (1, -r) for an affine root r of F mod p (a = r*b) and (-s, 1) for a projective one (b = s*a, s = 0 mod the prime).
 // p | y1*a + y0*b with (a,b) = i*(a0,b0)+j*(a1,b1)  <=>  i*A + j*B = 0 (mod p), A = y1*a0 + y0*b0, B = y1*a1 + y0*b1.
-__global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_t a1, int64_t b1)
+// row0: the log sum of the entries that divide the value at (i,j) = (1,0), i.e. at (a0,b0) (those with A = 0): the sieve
+// sum of that point, with which the host tests it (row j = 0 is not sieved).
+__global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_t a1, int64_t b1, uint32_t* row0)
 {
 	int k = blockIdx.x * blockDim.x + threadIdx.x;
 	if (k >= fb.n) return;
@@ -459,6 +461,7 @@ __global__ void k_transform(DevFB fb, uint64_t q, int64_t a0, int64_t b0, int64_
 	uint64_t y0 = fb.y0[k], y1 = fb.y1[k];
 	if (p == q || (q % p == 0 && k < fb.nsmall)) { fb.R[k] = R_SKIP; return; }
 	uint64_t A = (y1 * d_mod(a0, p) % p + y0 * d_mod(b0, p) % p) % p;
+	if (A == 0) atomicAdd(row0, (uint32_t)fb.logp[k]);
 	uint64_t B = (y1 * d_mod(a1, p) % p + y0 * d_mod(b1, p) % p) % p;
 	if (A == 0) {   // p^k | i*A + j*B  <=>  p^k | j (when p does not divide B): whole rows j = 0 (mod p^k)
 		if (k < fb.nsmall && B % fb.base[k] != 0) { fb.R[k] = R_PROJ; fb.proj[atomicAdd(fb.nproj, 1u)] = k; }
@@ -1002,8 +1005,8 @@ int main(int argc, char** argv)
 		CHECK(cudaEventCreateWithFlags(&L.rows_done, cudaEventDisableTiming));
 	}
 	struct Slot {
-		OutPair* dout; unsigned int* dn; unsigned long long* dropped;          // device
-		OutPair* hout; unsigned int* hn; unsigned long long* hdropped;         // pinned host
+		OutPair* dout; unsigned int* dn; unsigned long long* dropped; uint32_t* drow0;    // device
+		OutPair* hout; unsigned int* hn; unsigned long long* hdropped; uint32_t* hrow0;   // pinned host
 		cudaEvent_t e[6];                         // e[0..1]: transform timing; e[5]: n and dropped copied
 		std::vector<cudaEvent_t> pe;              // per pass: buckets start, end, rows start, end
 		uint32_t used;                            // passes of the special-q in this slot
@@ -1012,6 +1015,7 @@ int main(int argc, char** argv)
 		CHECK(cudaMalloc(&s.dout, (size_t)maxout * sizeof(OutPair))); CHECK(cudaMalloc(&s.dn, 4)); CHECK(cudaMalloc(&s.dropped, 8));
 		CHECK(cudaMallocHost(&s.hout, (size_t)maxout * sizeof(OutPair))); CHECK(cudaMallocHost(&s.hn, 4));
 		CHECK(cudaMallocHost(&s.hdropped, 8));
+		CHECK(cudaMalloc(&s.drow0, 4)); CHECK(cudaMallocHost(&s.hrow0, 4));
 		for (cudaEvent_t& ev : s.e) CHECK(cudaEventCreate(&ev));
 		s.pe.resize(4 * (size_t)nparts);
 		for (cudaEvent_t& ev : s.pe) CHECK(cudaEventCreate(&ev));
@@ -1052,9 +1056,9 @@ int main(int argc, char** argv)
 		const QLattice& Q = qs[k]; Lane& L = lane[k % lanes]; Slot& s = slot[k & 1];
 		if (k >= (size_t)lanes) CHECK(cudaStreamWaitEvent(sb, L.rows_done, 0));   // rows of the lane's previous special-q done
 		CHECK(cudaMemsetAsync(L.fb.nproj, 0, 4, sb)); CHECK(cudaMemsetAsync(L.fb.npart, 0, 4, sb));
-		CHECK(cudaMemsetAsync(s.dropped, 0, 8, sb)); CHECK(cudaMemsetAsync(s.dn, 0, 4, sb));
+		CHECK(cudaMemsetAsync(s.dropped, 0, 8, sb)); CHECK(cudaMemsetAsync(s.dn, 0, 4, sb)); CHECK(cudaMemsetAsync(s.drow0, 0, 4, sb));
 		CHECK(cudaEventRecord(s.e[0], sb));
-		k_transform<<<(fb.n + 255) / 256, 256, 0, sb>>>(L.fb, Q.q, Q.a0, Q.b0, Q.a1, Q.b1);
+		k_transform<<<(fb.n + 255) / 256, 256, 0, sb>>>(L.fb, Q.q, Q.a0, Q.b0, Q.a1, Q.b1, s.drow0);
 		CHECK(cudaEventRecord(s.e[1], sb));
 		// value/q = alpha*i + beta*j with alpha = (Y1*a0 + Y0*b0)/q, beta = (Y1*a1 + Y0*b1)/q
 		// (scaled by 2^-e: they can exceed the float range)
@@ -1096,6 +1100,7 @@ int main(int argc, char** argv)
 		}
 		CHECK(cudaMemcpyAsync(s.hn, s.dn, 4, cudaMemcpyDeviceToHost, sr));
 		CHECK(cudaMemcpyAsync(s.hdropped, s.dropped, 8, cudaMemcpyDeviceToHost, sr));
+		CHECK(cudaMemcpyAsync(s.hrow0, s.drow0, 4, cudaMemcpyDeviceToHost, sr));
 		CHECK(cudaEventRecord(s.e[5], sr));
 	};
 
@@ -1129,13 +1134,19 @@ int main(int argc, char** argv)
 			if (a % q == 0 && b % q == 0) continue;
 			uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12;
 		}
-		{   // row j = 0 is not sieved; its only coprime point (i,j) = (1,0) is (a0,b0), a short vector with a small value
+		{   // row j = 0 is not sieved; its only coprime point (i,j) = (1,0) is (a0,b0). It survives like every other point: if
+			// its sieve sum (the log sum of the entries dividing its value, from k_transform) comes within mfb+slack bits of
+			// log2|F(a0,b0)/q|. (Up to f764f7a it was written without this test, so a non-smooth pair per special-q on sides
+			// such as x - m with a large m, where F(a0,b0) is about m*b0.)
 			int64_t a = Q.a0, b = Q.b0;
 			if (b < 0) { a = -a; b = -b; }
 			int64_t g = a < 0 ? -a : a, y = b;
 			while (y) { int64_t t = g % y; g = y; y = t; }
 			const bool dummy_ok = !dummy || log2(fabs((double)dc1 * (double)a + (double)dc0 * (double)b) + 1) < dummy_bits;
-			if (b > 0 && b < (1ll << 32) && g == 1 && dummy_ok) {
+			long double F = 0, pa = 1;
+			for (int t = 0; t <= sdeg; t++) { long double pb = 1; for (int u = t; u < sdeg; u++) pb *= (long double)b; F += sc[t] * pa * pb; pa *= (long double)a; }
+			const bool sieved_ok = F != 0 && (double)*s.hrow0 >= (double)log2l(fabsl(F) / (long double)Q.q) - (double)(mfb + slack);
+			if (b > 0 && b < (1ll << 32) && g == 1 && dummy_ok && sieved_ok) {
 				uint32_t b32 = (uint32_t)b; memcpy(w, &a, 8); memcpy(w + 8, &b32, 4); w += 12; n++;
 			}
 		}

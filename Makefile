@@ -1,8 +1,8 @@
 # gpusieve and its tools (see README.txt).
 #
-#   make            gpusieve, absort and ab2keys
+#   make            gpusieve, absort, absplit and ab2keys
 #   make gpusieve   only the GPU siever, which needs the CUDA Toolkit (nvcc)
-#   make tools      only absort and ab2keys, which need no CUDA
+#   make tools      only absort, absplit and ab2keys, which need no CUDA
 #   make clean
 #
 # Settings, on the command line (make CUDA_ARCH="70 80" NVCC_CCBIN=g++-13):
@@ -36,7 +36,7 @@ NVCCFLAGS = -std=c++17 -O3 $(NVCC_ARCH) -t $(NVCC_THREADS) $(if $(NVCC_CCBIN),-c
 
 .PHONY: all tools clean
 all: gpusieve tools
-tools: absort ab2keys
+tools: absort absplit ab2keys
 
 gpusieve: gpusieve.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -44,8 +44,11 @@ gpusieve: gpusieve.cu
 absort: absort.cpp
 	$(CXX) -std=c++17 $(OPT) -fopenmp -o $@ $<
 
+absplit: absplit.c
+	$(CC) $(OPT) -o $@ $<
+
 ab2keys: ab2keys.c
 	$(CC) $(OPT) -o $@ $<
 
 clean:
-	rm -f gpusieve absort ab2keys
+	rm -f gpusieve absort absplit ab2keys

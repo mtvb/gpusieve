@@ -23,8 +23,8 @@ finds the same relations as las.
 ## Build
 
 ```
-make            gpusieve, absort and ab2keys
-make tools      only absort and ab2keys (no CUDA needed)
+make            gpusieve, absort, absplit and ab2keys
+make tools      only absort, absplit and ab2keys (no CUDA needed)
 ```
 
 | Setting | Meaning |
@@ -100,6 +100,26 @@ absort sorts all pairs, removes duplicates (a pair is found by every special-q t
 than 90% of the available memory, absort sorts them in batches, writes each batch to a temporary file (8 bytes per pair,
 in the output's folder or `-tmp DIR`), and merges these into the output. The temporary files need up to 8 bytes per pair
 of disk space, which the merge gives back as it goes.
+
+To add new pairs to an existing store, sort only the new ones and merge the two sorted files. `absort -merge` reads its
+inputs in one pass, with 3 MB of memory each, and removes the pairs found in both (about 12M pairs per second, one core):
+
+```
+absort -side 0 -o new.ab part3.txt part4.txt ...
+absort -merge -o store2.ab store.ab new.ab
+```
+
+**Survivors of gpusieve up to f764f7a** contain the lattice basis vector (a0, b0) of each special-q without a smoothness
+test (later versions test it like every other point). On a sieved side such as x - m with a large m its value is about
+m·b0, almost never smooth. Such a pair is small, so for a deg-4 SNFS number it is smooth on the algebraic side: every
+per-number check finds it, and NFS_factory then spends about a second of one CPU core on each before dropping it. If such
+survivors were not checked, check at least their pairs with small b (b0 is below about the square root of q):
+
+```
+absplit -side 1 -small small.ab -large large.ab surv1.ab surv2.ab ...
+NFS_factory_gpu storecheck.poly small.ab small.k
+absort -side 0 -o store.ab small.k large.ab
+```
 
 ### 5. Use the store for a number
 
@@ -225,6 +245,8 @@ of each special-q before the next, in ascending order of special-q, and does not
 | Tool | Purpose |
 |---|---|
 | `absort [-side S] [-threads N] [-mem GB] [-tmp DIR] -o out.ab in ...` | Sorts `.ab` files and text files of `a,b` lines by (a, b), removes duplicates, and writes one `.ab` file (`-o -` for standard output). Needs 16 bytes of memory per pair, and uses at most 90% of the available memory (or `-mem GB`). If it needs more, it sorts in batches and merges them through temporary files of 8 bytes per pair in `-tmp DIR` (default: the output's folder). |
+| `absort -merge [-side S] -o out.ab sorted.ab ...` | Merges `.ab` files that are already sorted (as absort writes them) in one pass, with 3 MB of memory per input, and removes duplicates (`-` reads one input from standard input). The output must not be an input. |
+| `absplit [-b B] [-side S] [-small s.ab] [-large l.ab] in.ab ...` | Splits `.ab` files by b, streaming: pairs with b < B (default 2^20) to `-small`, the others to `-large`, in input order (`-` reads standard input). `-side` sets the outputs' header side. |
 | `ab2keys file.ab ...` | Writes the pairs of `.ab` files as `a,b` lines. |
 | `lastq.py poly file.ab Q0 Q1 [-side S]` | The special-q of the last pair of an interrupted run, to continue with `-q0`. |
 | `lasnorm.pl` | Rewrites CADO-format relations as las prints them, so that `sort -u` removes relations found by both. |
